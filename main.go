@@ -3,9 +3,12 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -40,8 +43,13 @@ func main() {
 	manifest, err := docker_image.Manifest()
 
 	if manifest != nil {
-		report := AlpineScanner(*manifest, docker_image)
-		fmt.Println(report)
+		report, _ := AlpineScanner(*manifest, docker_image)
+		fmt.Printf("%+v\n", report)
+
+		vulns, err := AlpineMatcher(*report)
+
+		fmt.Println(err)
+		fmt.Println(vulns)
 	}
 }
 
@@ -55,13 +63,13 @@ type AlpinePackage struct {
 	Version string
 }
 
-func AlpineScanner(manifest v1.Manifest, image v1.Image) AlpineReport {
+func AlpineScanner(manifest v1.Manifest, image v1.Image) (*AlpineReport, error) {
 	layers := []v1.Layer{}
 	for _, layer_desc := range manifest.Layers {
 		layer, err := image.LayerByDigest(layer_desc.Digest)
 
 		if err != nil {
-			fmt.Printf("Error fetching layer %s: %s", layer_desc.Digest, err.Error())
+			return nil, fmt.Errorf("Error fetching layer %s: %w", layer_desc.Digest, err.Error())
 		}
 		layers = append(layers, layer)
 	}
@@ -110,7 +118,7 @@ func AlpineScanner(manifest v1.Manifest, image v1.Image) AlpineReport {
 
 				for _, line := range lines {
 					if strings.Contains(string(line), "VERSION_ID") {
-						version = strings.Replace(strings.Replace(string(line), "VERSION_ID=", "", 1), "\"", "", 2)
+						fmt.Sscanf(string(line), "VERSION_ID=%s", &version)
 					}
 				}
 			}
@@ -119,5 +127,79 @@ func AlpineScanner(manifest v1.Manifest, image v1.Image) AlpineReport {
 
 	}
 
-	return AlpineReport{Packages: packages, Version: semver.MajorMinor("v" + version)}
+	return &AlpineReport{
+		Packages: packages,
+		Version:  version,
+	}, nil
+}
+
+type Vulnerability struct {
+	CVEs        []string
+	PackageName string
+	Version     string
+}
+
+type SecDBReport struct {
+	Packages []SecDBPackage
+}
+
+type SecDBPackage struct {
+	Pkg SecDBPkg
+}
+
+type SecDBPkg struct {
+	Name     string
+	Secfixes map[string][]string
+}
+
+func AlpineMatcher(report AlpineReport) ([]Vulnerability, error) {
+	vulnerable_packages := []Vulnerability{}
+
+	majorMinorVersion := semver.MajorMinor("v" + report.Version)
+
+	client := http.Client{}
+
+	secDBURL, err := url.Parse(fmt.Sprintf("https://secdb.alpinelinux.org/%s/main.json", majorMinorVersion))
+
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := client.Do(&http.Request{
+		Method: "GET",
+		URL:    secDBURL,
+	})
+
+	if res.StatusCode > 399 {
+		return nil, fmt.Errorf("error fetching Alpine SecDB data for version %s, got code %d", majorMinorVersion, res.StatusCode)
+	}
+
+	responseBytes, err := io.ReadAll(res.Body)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var contents SecDBReport
+
+	err = json.Unmarshal(responseBytes, &contents)
+
+	if err != nil {
+		return nil, err
+	}
+
+	for _, installed_package := range report.Packages {
+		for _, secdb_package := range contents.Packages {
+			if secdb_package.Pkg.Name == installed_package.Name {
+				if CVEs, ok := secdb_package.Pkg.Secfixes[installed_package.Version]; ok {
+					vulnerable_packages = append(vulnerable_packages, Vulnerability{
+						PackageName: installed_package.Name,
+						CVEs:        CVEs,
+					})
+				}
+			}
+		}
+	}
+
+	return vulnerable_packages, nil
 }
